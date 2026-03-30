@@ -1,0 +1,9 @@
+flask
+flask-cors
+flask-socketio
+flask-apscheduler
+flask-sqlalchemy
+paramiko
+eventlet
+requests
+pywebview
