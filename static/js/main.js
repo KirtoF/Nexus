@@ -4,6 +4,8 @@ document.addEventListener('DOMContentLoaded', () => {
     let activeSessionId = null;
     let aceEditor = null;
     let aiModels = [];
+    let isAiResponding = false; // AI 响应状态位
+    let activeIntervals = []; // [追踪后台计时器]
 
     // --- 核心调试：初始化编辑器 ---
     function initAce() {
@@ -33,6 +35,58 @@ document.addEventListener('DOMContentLoaded', () => {
             aceEditor.renderer.setPadding(20);
             aceEditor.renderer.setScrollMargin(10, 10);
         }
+    }
+
+    // --- 全局通知提示 (Toast) ---
+    window.showToast = function(message, type = 'success') {
+        const container = document.getElementById('toast-container');
+        if (!container) return;
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        toast.innerHTML = `<i data-lucide="${type === 'success' ? 'check-circle' : 'alert-circle'}"></i> <span>${message}</span>`;
+        container.appendChild(toast);
+        safeCreateIcons();
+        setTimeout(() => {
+            toast.classList.add('fade-out');
+            setTimeout(() => toast.remove(), 400);
+        }, 3000);
+    };
+
+    // --- 终端内容捕捉 (AI 分析增强) ---
+    function captureActiveTerminal() {
+        if (!activeSessionId || !sessions[activeSessionId]) {
+            showToast("请先连接到一个终端会话", "error");
+            return;
+        }
+        const term = sessions[activeSessionId].term;
+        const buffer = term.buffer.active;
+        let contentArr = [];
+        
+        // 捕捉最后 100 行有效内容
+        const maxLines = 100;
+        const totalLines = buffer.length;
+        const start = Math.max(0, totalLines - maxLines);
+        
+        for (let i = start; i < totalLines; i++) {
+            const line = buffer.getLine(i);
+            if (line) {
+                const text = line.translateToString(true).trimEnd();
+                // 即使是空行，只要在指令流中也保留 (但不保留大面积前缀空格)
+                if (text) contentArr.push(text);
+                else if (contentArr.length > 0 && contentArr[contentArr.length-1] !== "") {
+                    // 允许一个空行作为间隔
+                    contentArr.push("");
+                }
+            }
+        }
+
+        const input = document.getElementById('chat-input');
+        const contextHeader = `\n--- [Terminal Summary: ${sessions[activeSessionId].server.name} @ ${new Date().toLocaleTimeString()}] ---\n`;
+        const footer = `\n--- [End Capture] ---\n`;
+        
+        input.value += contextHeader + contentArr.slice(-80).join('\n') + footer;
+        input.focus();
+        showToast("已提取终端实时上下文至 AI 会话栏");
     }
 
     // --- 图标渲染 ---
@@ -163,6 +217,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (e.target.id === 'save-file-btn') handleSaveFile();
         if (e.target.closest('#close-modal')) document.getElementById('server-modal').classList.remove('open');
         if (e.target.id === 'save-server') handleSaveServer();
+        if (e.target.id === 'capture-terminal' || e.target.closest('#capture-terminal')) {
+            captureActiveTerminal();
+        }
 
         // 8. 模型配置弹窗
         const closeModelBtn = e.target.closest('#close-model-modal') || e.target.closest('#cancel-model-btn');
@@ -316,10 +373,10 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await res.json();
             if (data.success) {
-                alert('保存成功');
+                showToast('文件已成功同步至远程服务器');
                 modal.classList.remove('open');
-            } else { alert('保存失败: ' + data.error); }
-        } catch(e) { alert('保存异常: ' + e.message); }
+            } else { showToast('保存失败: ' + data.error, 'error'); }
+        } catch(e) { showToast('保存异常: ' + e.message, 'error'); }
     }
 
     function handleDownload(filename) {
@@ -444,6 +501,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
         initResizer(sessions[sid].el);
         switchSession(sid);
+        
+        // [新增] 启动会话时立即深度隐藏首页，解决桌面端点击慢导致的重合
+        const welcome = document.getElementById('welcome-screen');
+        if (welcome) welcome.style.display = 'none';
+        
         safeCreateIcons();
     }
 
@@ -683,19 +745,17 @@ document.addEventListener('DOMContentLoaded', () => {
         });
         const result = await res.json();
         if (result.success) {
+            showToast(sid ? "配置更新成功" : "新服务器已添加");
             if (sid) {
-                // 如果是编辑，关闭弹窗
                 document.getElementById('server-modal').classList.remove('open');
             } else {
-                // 如果是新增，清空表单以便继续添加 (保留分组，方便批量录入相同分组的服务器)
                 const group = document.getElementById('s-group').value;
                 document.getElementById('server-form').reset();
                 document.getElementById('s-group').value = group;
-                
-                // 给个控制台或轻量反馈 (此处可通过界面元素提示，暂保持简洁)
-                console.log("[UI] Server added, keeping modal open for next entry.");
             }
             loadServers();
+        } else {
+            showToast(result.error || "保存失败", "error");
         }
     }
 
@@ -735,16 +795,25 @@ document.addEventListener('DOMContentLoaded', () => {
         // 首页/资产模块特殊逻辑
         if (module === 'ops') {
             loadServers();
-            welcome.style.display = activeSessionId ? 'none' : 'flex';
+            // 只有在没有任何标签页时才显示欢迎页
+            const hasTabs = Object.keys(sessions).length > 0;
+            welcome.style.display = (activeSessionId || hasTabs) ? 'none' : 'flex';
+            
             document.getElementById('tab-bar').style.display = 'flex';
             if (activeSessionId) {
                 document.querySelectorAll('.tab-page').forEach(p => p.classList.toggle('active', p.id === `page-${activeSessionId}`));
             }
         } else {
+            // [新增] 进入非资产模块时，强力隐藏欢迎界面和标签栏
             welcome.style.display = 'none';
             document.getElementById('tab-bar').style.display = 'none';
             document.querySelectorAll('.tab-page').forEach(p => p.classList.remove('active'));
             
+            // [核心性能增强] 清理所有后台监控计数器，防止桌面端请求堆积
+            console.log(`[SYS] Clearing ${activeIntervals.length} active intervals before switching to ${module}`);
+            activeIntervals.forEach(clearInterval);
+            activeIntervals = [];
+
             // 渲染模块侧边栏和主界面
             renderModuleSidebar(module);
             renderModule(module);
@@ -825,25 +894,39 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function renderMonitor(container) {
+        // [核心优化] 进入监控屏前先彻底清空之前的计时器，防止由于内存残留导致的并发风暴
+        activeIntervals.forEach(clearInterval);
+        activeIntervals = [];
+
         container.innerHTML = `<div class="monitor-dashboard"><h2>实时资源监控</h2><div class="metrics-grid" id="monitor-grid"></div></div>`;
         const res = await fetch('/api/servers');
         const servers = await res.json();
         const grid = document.getElementById('monitor-grid');
+        
         servers.forEach(s => {
             const card = document.createElement('div');
             card.className = 'metric-card'; card.id = `card-${s.id}`;
             card.innerHTML = `<h4>${s.name}</h4><div class="metric-item" style="color:#abb2bf; font-size:12px">CPU 负载: <span class="cpu-v">-</span>% <div class="progress-bar" style="margin-top:5px"><div class="fill cpu-f"></div></div></div>`;
             grid.appendChild(card);
-            setInterval(async () => {
+            
+            const timerId = setInterval(async () => {
                 try {
                     const r = await fetch(`/api/monitoring/${s.id}`);
                     const {data} = await r.json();
                     if (data) {
-                        card.querySelector('.cpu-v').innerText = data.cpu_usage;
-                        card.querySelector('.cpu-f').style.width = data.cpu_usage+'%';
+                        const vEl = card.querySelector('.cpu-v');
+                        const fEl = card.querySelector('.cpu-f');
+                        if (vEl && fEl) {
+                            vEl.innerText = data.cpu_usage;
+                            fEl.style.width = data.cpu_usage+'%';
+                        }
                     }
-                } catch(e) {}
+                } catch(e) {
+                    // console.error("Monitor fetch fail:", e);
+                }
             }, 3000);
+            
+            activeIntervals.push(timerId); // 注册到全局管理池
         });
     }
 
@@ -1015,9 +1098,12 @@ document.addEventListener('DOMContentLoaded', () => {
             body: JSON.stringify(data)
         });
         if ((await res.json()).success) {
+            showToast("AI 模型配置已更新");
             closeModelModal();
             updateModelSelector();
-        document.querySelector('.auto-nav-item.active')?.click();
+            document.querySelector('.auto-nav-item.active')?.click();
+        } else {
+            showToast("模型配置保存失败", "error");
         }
     }
 
@@ -1047,11 +1133,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function sendMessage() {
+        if (isAiResponding) return;
         const text = chatInput.value.trim();
         if (!text) return;
         
+        isAiResponding = true;
+        sendBtn.disabled = true;
+        sendBtn.classList.add('loading');
+        sendBtn.innerHTML = '<i data-lucide="loader-2"></i>';
+        safeCreateIcons();
+
         chatBox.insertAdjacentHTML('beforeend', `<div class="message user"><div class="message-avatar">U</div><div class="bubble">${text}</div></div>`);
-        chatInput.value = ''; chatBox.scrollTop = chatBox.scrollHeight;
+        chatInput.value = ''; 
+        chatBox.scrollTop = chatBox.scrollHeight;
         
         const loadingId = 'ai-' + Date.now();
         // 核心优化：加载状态即展示头像，提升等待体验
@@ -1079,7 +1173,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const rawContent = data.reply || data.error || '无返回内容';
         const formatted = window.marked ? window.marked.parse(rawContent) : rawContent;
         
-        // 替换气泡内容，保持头像一致
         document.getElementById(loadingId).innerHTML = `
             <div class="message-avatar"><i data-lucide="bot"></i></div>
             <div class="bubble">${formatted}</div>`;
@@ -1093,6 +1186,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         
         chatBox.scrollTop = chatBox.scrollHeight;
+
+        // 状态重置
+        isAiResponding = false;
+        sendBtn.disabled = false;
+        sendBtn.classList.remove('loading');
+        sendBtn.innerHTML = '<i data-lucide="arrow-up"></i>';
+        safeCreateIcons();
     }
 
     if (sendBtn) {
@@ -1243,26 +1343,26 @@ document.addEventListener('DOMContentLoaded', () => {
                     <button class="btn-confirm" id="add-script-btn">+ 新增脚本库</button>
                 </div>
                 
-                <div class="script-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:24px; margin-top:30px">
+                <div class="script-grid" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:18px; margin-top:20px">
                     ${scripts.map(s => `
                         <div class="script-card-v2">
                             <div class="card-banner">
                                 <div class="script-type">${s.type}</div>
-                                <div style="display:flex; gap:8px">
+                                <div style="display:flex; gap:10px">
                                     <button class="icon-button script-edit-wrap" data-id="${s.id}" title="编辑"><i data-lucide="edit-3"></i></button>
-                                    <button class="icon-button script-del-wrap" data-id="${s.id}" title="删除" style="color:#f43f5e"><i data-lucide="trash-2"></i></button>
+                                    <button class="icon-button script-del-wrap" data-id="${s.id}" title="删除" style="color:rgba(244, 63, 94, 0.6)"><i data-lucide="trash-2"></i></button>
                                 </div>
                             </div>
                             <div class="card-body">
                                 <h3>${s.name}</h3>
-                                <div class="desc">${s.description || '暂无详细描述'}</div>
+                                <div class="desc">${s.description || '维护您的 Shell/Python 脚本，支持远程分发运行'}</div>
                             </div>
                             <div class="card-footer">
-                                <div style="font-size:11px; color:var(--text-muted)">
-                                    <i data-lucide="clock" style="width:10px; margin-right:4px"></i> 常用
+                                <div style="font-size:11px; color:var(--text-muted); display:flex; align-items:center; gap:6px">
+                                    <i data-lucide="clock" style="width:12px; opacity:0.6"></i> 常用
                                 </div>
-                                <button class="btn-confirm-sm script-run" data-id="${s.id}" data-content="${encodeURIComponent(s.content)}" style="padding:6px 16px; font-size:11px">
-                                    <i data-lucide="play" style="width:12px; margin-right:6px"></i> 立即执行
+                                <button class="btn-script-run script-run" data-id="${s.id}" data-content="${encodeURIComponent(s.content)}">
+                                    <i data-lucide="zap" style="width:12px"></i> 立即执行
                                 </button>
                             </div>
                         </div>
@@ -1305,8 +1405,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify(data)
             });
             if (res.ok) {
+                showToast("脚本已成功存入库");
                 modal.style.display = 'none';
                 renderScriptManagement(container);
+            } else {
+                showToast("脚本保存失败", "error");
             }
         };
     }

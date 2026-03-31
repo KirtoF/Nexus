@@ -1,22 +1,68 @@
-import eventlet
-eventlet.monkey_patch()
-from flask import Flask, render_template, jsonify, request
-from flask_cors import CORS
-from models import db, Server, AuditLog, Script, FileTask, Document, AIModel, ScheduledTask
-from flask_apscheduler import APScheduler
-from utils.ssh_manager import SSHManager
 import os
+import sys
 import stat
 import paramiko
 import random
 import threading
 import time
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
-from flask_socketio import SocketIO, emit
 
-app = Flask(__name__)
+# 桌面端打包环境下禁用 eventlet 以提高兼容性
+is_bundled = hasattr(sys, '_MEIPASS')
+
+# 基础路径计算：开发环境在当前目录，打包环境在 exe 同级目录
+if is_bundled:
+    base_dir = os.path.dirname(sys.executable)
+    async_mode = 'threading'
+else:
+    base_dir = os.path.abspath(".")
+    import eventlet
+    eventlet.monkey_patch()
+    async_mode = 'eventlet'
+
+# [核心优化] 全局文件日志系统
+log_file = os.path.join(base_dir, 'nexus.log')
+log_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[log_handler]
+)
+
+# 如果是桌面端打包版本（隐藏了控制台），则重定向标准输出到文件日志
+if is_bundled:
+    class LoggerWriter:
+        def __init__(self, level): self.level = level
+        def write(self, message): 
+            if message.strip(): self.level(message.strip())
+        def flush(self): pass
+    sys.stdout = LoggerWriter(logging.info)
+    sys.stderr = LoggerWriter(logging.error)
+
+logging.info(f"Nexus AIOps Platform Initializing... (Mode: {'Bundled' if is_bundled else 'Development'})")
+
+from flask import Flask, render_template, jsonify, request
+from flask_cors import CORS
+from models import db, Server, AuditLog, Script, FileTask, Document, AIModel, ScheduledTask
+from flask_apscheduler import APScheduler
+from utils.ssh_manager import SSHManager
+from flask_socketio import SocketIO, emit
+import webview
+from concurrent.futures import ThreadPoolExecutor # [新增] 用于并发任务
+
+# 处理打包后的路径
+def get_resource_path(relative_path):
+    if is_bundled:
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
+app = Flask(__name__, 
+            template_folder=get_resource_path('templates'),
+            static_folder=get_resource_path('static'))
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=async_mode)
 
 # 调度器初始化
 scheduler = APScheduler()
@@ -26,9 +72,11 @@ scheduler.start()
 # 存储 sid 到 SSH 实例的映射
 # 结构: { sid: { 'ssh': client, 'shell': shell_chan, 'thread': worker } }
 ssh_sessions = {}
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(os.path.dirname(os.path.abspath(__file__)), 'nexus.db')
+
+# 数据库路径：开发环境在当前目录，打包环境在 exe 同级目录
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(base_dir, 'nexus.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+app.config['UPLOAD_FOLDER'] = os.path.join(base_dir, 'uploads')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 db.init_app(app)
 
@@ -655,22 +703,17 @@ def auto_execute():
         except Exception as e:
             return {"success": False, "output": f"Connection/Exec Error: {str(e)}"}
 
-    # 并发执行 (使用 eventlet 协程以适配 WebSocket 并发)
-    import eventlet
-    pool = eventlet.GreenPool(size=10)
-    
-    def worker(srv_id):
-        # 核心修复：在新协程中提供 Flask 应用上下文，否则 SQLAlchemy 查询会报错
-        with app.app_context():
-            try:
-                results[str(srv_id)] = run_on_server(srv_id, command)
-            except Exception as e:
-                results[str(srv_id)] = {"success": False, "output": f"Worker Context Error: {str(e)}"}
+    # 并发执行 (使用标准 ThreadPoolExecutor 以适配 threading 模式)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        def worker(srv_id):
+            with app.app_context():
+                try:
+                    results[str(srv_id)] = run_on_server(srv_id, command)
+                except Exception as e:
+                    results[str(srv_id)] = {"success": False, "output": f"Worker Context Error: {str(e)}"}
         
-    for sid in server_ids:
-        pool.spawn_n(worker, sid)
+        executor.map(worker, server_ids)
     
-    pool.waitall()
     # 强制确保 results 不为空
     if not results:
         results = {"status": {"success": False, "output": "未收集到执行结果，请检查后端并发状态。"}}
@@ -732,46 +775,41 @@ def auto_distribute():
         file.save(temp_path)
         
         results = {}
-        pool = eventlet.GreenPool(size=10)
-
-        def distribute_worker(srv_id):
-            with app.app_context():
-                try:
-                    server = Server.query.get(srv_id)
-                    if not server:
-                        results[str(srv_id)] = {"success": False, "error": "Server index not found"}
-                        return
-
-                    client = paramiko.SSHClient()
-                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            def distribute_worker(srv_id):
+                with app.app_context():
                     try:
-                        client.connect(server.ip, port=server.port, username=server.username, password=server.password, timeout=20)
-                        sftp = client.open_sftp()
-                        
-                        # 检测远程目录并尝试创建 (单层)
-                        try:
-                            sftp.chdir(remote_path)
-                        except IOError:
-                            try:
-                                sftp.mkdir(remote_path)
-                            except: pass
-                            
-                        target_file = os.path.join(remote_path, file.filename).replace('\\', '/')
-                        sftp.put(temp_path, target_file)
-                        sftp.close()
-                        client.close()
-                        results[str(srv_id)] = {"success": True, "message": f"Successfully pushed to {target_file}"}
-                    except Exception as e:
-                        results[str(srv_id)] = {"success": False, "error": f"SFTP Error: {str(e)}"}
-                except Exception as ex:
-                    results[str(srv_id)] = {"success": False, "error": f"Worker Error: {str(ex)}"}
+                        server = Server.query.get(srv_id)
+                        if not server:
+                            results[str(srv_id)] = {"success": False, "error": "Server index not found"}
+                            return
 
-        for sid in server_ids:
-            try:
-                pool.spawn_n(distribute_worker, int(sid))
-            except: pass
-        
-        pool.waitall()
+                        client = paramiko.SSHClient()
+                        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                        try:
+                            client.connect(server.ip, port=server.port, username=server.username, password=server.password, timeout=20)
+                            sftp = client.open_sftp()
+                            
+                            # 检测远程目录并尝试创建 (单层)
+                            try:
+                                sftp.chdir(remote_path)
+                            except IOError:
+                                try:
+                                    sftp.mkdir(remote_path)
+                                except: pass
+                                
+                            target_file = os.path.join(remote_path, file.filename).replace('\\', '/')
+                            sftp.put(temp_path, target_file)
+                            sftp.close()
+                            client.close()
+                            results[str(srv_id)] = {"success": True, "message": f"Successfully pushed to {target_file}"}
+                        except Exception as e:
+                            results[str(srv_id)] = {"success": False, "error": f"SFTP Error: {str(e)}"}
+                    except Exception as ex:
+                        results[str(srv_id)] = {"success": False, "error": f"Worker Error: {str(ex)}"}
+
+            # 启动并发任务
+            executor.map(distribute_worker, server_ids)
         
         # 任务完成后清理该特定临时文件
         try:
@@ -854,45 +892,72 @@ def toggle_task(tid):
 
 @app.route('/api/automation/inspect', methods=['POST'])
 def auto_inspect():
-    # 核心巡检逻辑：并发批量执行监控指令
+    # 核心修复：先在主线程获取所有服务器快照，避免多线程下的数据库竞争
     servers = Server.query.all()
-    results = []
-    pool = eventlet.GreenPool(size=10)
+    server_snapshots = []
+    for s in servers:
+        server_snapshots.append({
+            "id": s.id,
+            "name": s.name,
+            "ip": s.ip,
+            "port": s.port,
+            "username": s.username,
+            "password": s.password
+        })
 
-    def inspector(srv):
+    def inspector(srv_snapshot):
+        # 此时不需要 with app.app_context()，因为不访问数据库
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            client.connect(srv.ip, port=srv.port, username=srv.username, password=srv.password, timeout=20)
+            client.connect(
+                srv_snapshot['ip'], 
+                port=srv_snapshot['port'], 
+                username=srv_snapshot['username'], 
+                password=srv_snapshot['password'], 
+                timeout=15,
+                banner_timeout=20
+            )
             # 组合巡检命令：Load, Memory, Disk
-            stdin, stdout, stderr = client.exec_command("uptime; free -m | grep Mem; df -h / | tail -1")
-            output = stdout.read().decode().strip().split('\n')
+            stdin, stdout, stderr = client.exec_command("uptime; free -m | grep Mem; df -h / | tail -1", timeout=20)
+            output = stdout.read().decode(errors='replace').strip().split('\n')
             client.close()
             
-            # 解析 (简单逻辑)
-            load = output[0].split('load average:')[-1].strip() if len(output)>0 else 'N/A'
-            mem_info = output[1].split() if len(output)>1 else []
-            mem_usage = f"{mem_info[2]}/{mem_info[1]}MB" if len(mem_info)>2 else 'N/A'
-            disk_info = output[2].split() if len(output)>2 else []
-            disk_usage = disk_info[4] if len(disk_info)>4 else 'N/A'
+            # 强化解析逻辑
+            load = output[0].split('load average:')[-1].strip() if len(output) > 0 else 'N/A'
+            mem_usage = 'N/A'
+            if len(output) > 1:
+                parts = output[1].split()
+                if len(parts) >= 3:
+                     mem_usage = f"{parts[2]}/{parts[1]}MB"
+
+            disk_usage = 'N/A'
+            if len(output) > 2:
+                parts = output[2].split()
+                if len(parts) >= 5:
+                    disk_usage = parts[4]
             
             status = 'pass'
-            if disk_usage != 'N/A' and int(disk_usage.replace('%','')) > 85: status = 'warning'
+            if disk_usage != 'N/A' and '%' in disk_usage:
+                try:
+                    if int(disk_usage.replace('%','')) > 85: status = 'warning'
+                except: pass
             
             return {
-                "item": f"{srv.name} 健康状态",
+                "item": f"{srv_snapshot['name']} 健康状态",
                 "status": status,
                 "desc": f"负载: {load} | 内存: {mem_usage} | 磁盘: {disk_usage}"
             }
         except Exception as e:
             return {
-                "item": f"{srv.name} 连接异常",
+                "item": f"{srv_snapshot['name']} 连接异常",
                 "status": "fail",
                 "desc": f"SSH 失败: {str(e)}"
             }
 
-    for r in pool.imap(inspector, servers):
-        results.append(r)
+    # 使用标准 ThreadPoolExecutor 执行快照任务
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(inspector, server_snapshots))
 
     return jsonify({"success": True, "data": results})
 
@@ -925,7 +990,7 @@ def handle_ssh_connect(data):
                     data = shell.recv(4096).decode('utf-8', errors='ignore')
                     socketio.emit('terminal_output', data, room=sid)
                 else:
-                    socketio.sleep(0.02) # 防止 CPU 占用过高
+                    time.sleep(0.02) # 防止 CPU 占用过高
             
         socketio.start_background_task(read_from_shell, sid, shell)
         
@@ -949,6 +1014,24 @@ def handle_disconnect():
         del ssh_sessions[sid]
         print(f"Session {sid} closed.")
 
+def run_flask():
+    socketio.run(app, host='127.0.0.1', port=5000, allow_unsafe_werkzeug=True)
+
 if __name__ == '__main__':
-    # 必须使用 socketio.run 代替 app.run 以支持 WebSocket
-    socketio.run(app, debug=True, port=5000, host='0.0.0.0')
+    # 开发环境下的启动逻辑
+    if len(sys.argv) > 1 and sys.argv[1] == '--dev':
+        socketio.run(app, debug=True, host='127.0.0.1', port=5000)
+    else:
+        # 桌面端打包启动逻辑
+        t = threading.Thread(target=run_flask)
+        t.daemon = True
+        t.start()
+        
+        # 启动 WebView 窗口
+        time.sleep(3) # 给予 Flask 启动缓冲时间 (增加到 3s 以提高稳定性)
+        webview.create_window('Nexus - 智能运维管理平台', 
+                             'http://127.0.0.1:5000', 
+                             width=1280,
+                             height=800,
+                             background_color='#0a0c10')
+        webview.start(gui='edgehtml') # Windows 优先使用 Edge 核心

@@ -123,6 +123,9 @@
                                 <select class="model-mini-select" id="ai-model-selector">
                                     <option value="">OpenAI (Default)</option>
                                 </select>
+                                <button class="icon-button" id="capture-terminal" title="获取当前终端内容给 AI 分析" style="width:34px; height:34px; margin-left:8px; opacity:0.8; background:rgba(255,255,255,0.03); border:1px solid var(--border-glass); border-radius:8px; color:var(--text-bright); cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all 0.2s">
+                                    <i data-lucide="terminal" style="width:18px"></i>
+                                </button>
                             </div>
                             <button class="send-btn" id="send-chat" title="发送 (Enter)">
                                 <i data-lucide="arrow-up"></i>
@@ -145,6 +148,7 @@
                 <div class="status-item">Nexus v1.0.0</div>
             </div>
         </footer>
+        <div class="toast-container" id="toast-container"></div>
     </div>
 
     <!-- 弹窗与悬浮组件 (移出 Grid 容器以消除布局间隙) -->

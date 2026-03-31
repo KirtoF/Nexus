@@ -12,13 +12,12 @@ env/
 nexus.db
 uploads/
 temp/
-logs/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
+# Build & Logs
+build/
+dist/
+nexus.log
+Nexus-AIOps.exe
+*.spec
 
 # OS
 .DS_Store
